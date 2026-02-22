@@ -1,143 +1,176 @@
 # openclaw-tg-dl-using-localapi
 
-Patch [OpenClaw](https://github.com/openclaw/openclaw) to support [Telegram Local Bot API Server](https://core.telegram.org/bots/api#using-a-local-bot-api-server) for file downloads, bypassing the 20 MB limit (up to 2 GB).
+An [OpenClaw](https://github.com/openclaw/openclaw) skill that enables downloading Telegram files >20 MB via a [Local Bot API Server](https://core.telegram.org/bots/api#using-a-local-bot-api-server), bypassing the standard Bot API 20 MB limit (up to 2 GB).
 
 ## Problem
 
-The standard Telegram Bot API limits file downloads to 20 MB. When a user sends a larger file, OpenClaw's `resolveMedia()` fails silently and the AI never receives the file.
+The Telegram Bot API limits file downloads to 20 MB. When a user sends a larger file, OpenClaw's `resolveMedia()` fails and the AI has no way to access the file.
 
 ## Solution
 
-This project patches OpenClaw's bundled dist files to add `localBotApiUrl` config support. When configured:
+This skill provides two layers of support:
 
-- **File downloads** (getFile + file content) go through your Local Bot API Server → no 20 MB limit
-- **Everything else** (sending messages, reactions, etc.) stays on the standard Telegram API
+### Layer 1: `localBotApiUrl` Config (Transparent)
 
-This is the same approach that grammY natively supports via `apiRoot`, but OpenClaw doesn't expose it.
+Patches OpenClaw's `resolveMedia()` to download files through a Local Bot API Server when `localBotApiUrl` is configured. This removes the 20 MB limit entirely — files up to 2 GB are downloaded automatically with no AI intervention.
+
+### Layer 2: `<telegram_large_file>` Tag (Fallback)
+
+If `resolveMedia()` still fails (Local Bot API down, misconfigured, etc.), the patch injects file metadata into the message body as a `<telegram_large_file>` tag. The AI can then call the included download script to fetch the file.
+
+### Download Script (`scripts/tg-download.sh`)
+
+Downloads files by `file_id` via the Local Bot API Server with a 3-tier fallback:
+1. **Volume mount** — direct host filesystem copy (fastest)
+2. **docker cp** — copy from container (default)
+3. **HTTP download** — standard Bot API endpoint (fallback)
 
 ## Prerequisites
 
-- A running [telegram-bot-api](https://github.com/tdlib/telegram-bot-api) Docker container
-- `api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org)
+- A running `telegram-bot-api` Docker container with `TELEGRAM_LOCAL=true`
+- `docker`, `curl`, `python3` available on the host
 - OpenClaw installed globally via npm
-- Node.js
 
 ## Installation
 
-### 1. Clone
+### As an OpenClaw Skill
 
 ```bash
+# Clone
 git clone https://github.com/Kinolian1107/openclaw-tg-dl-using-localapi.git ~/git/openclaw-tg-dl-using-localapi
-```
 
-### 2. Docker Setup (if not already running)
-
-Add to your `docker-compose.yml`:
-
-```yaml
-telegram-bot-api:
-  image: aiogram/telegram-bot-api:latest
-  restart: unless-stopped
-  environment:
-    TELEGRAM_API_ID: "<your-api-id>"
-    TELEGRAM_API_HASH: "<your-api-hash>"
-    TELEGRAM_LOCAL: "true"
-  ports:
-    - "18995:8081"
-  volumes:
-    - telegram-bot-api-data:/var/lib/telegram-bot-api
-```
-
-### 3. Apply the Patch
-
-```bash
-# Preview changes
-node ~/git/openclaw-tg-dl-using-localapi/patch/apply-patch.js --dry-run
-
-# Apply
-node ~/git/openclaw-tg-dl-using-localapi/patch/apply-patch.js
-```
-
-Or use the wrapper script:
-
-```bash
-bash ~/git/openclaw-tg-dl-using-localapi/patch/apply-patch.sh
-```
-
-### 4. Configure OpenClaw
-
-Add to `~/.openclaw/openclaw.json` under `channels.telegram`:
-
-```json
-{
-  "channels": {
-    "telegram": {
-      "localBotApiUrl": "http://localhost:18995",
-      "mediaMaxMb": 2000
-    }
-  }
-}
-```
-
-### 5. Restart Gateway
-
-```bash
-openclaw gateway restart
-```
-
-### 6. (Optional) Install as OpenClaw Skill
-
-The repo also includes a standalone download script. To make it available as a skill:
-
-```bash
+# Symlink into OpenClaw skills
 ln -s ~/git/openclaw-tg-dl-using-localapi ~/.openclaw/skills/tg-dl-localapi
-```
 
-## After `openclaw update`
+# Apply patches to OpenClaw dist
+node ~/git/openclaw-tg-dl-using-localapi/scripts/patch-openclaw.js
 
-Each `openclaw update` replaces the dist files. Re-apply the patch:
+# Configure openclaw.json (add under channels.telegram)
+# "mediaMaxMb": 2000,
+# "localBotApiUrl": "http://localhost:18995"
 
-```bash
-node ~/git/openclaw-tg-dl-using-localapi/patch/apply-patch.js
+# Restart gateway
 openclaw gateway restart
 ```
 
-The patch is **idempotent** — safe to re-run on already-patched files.
+### After `openclaw update`
 
-To restore original dist files:
+The patch modifies dist files that get replaced on update. Re-apply:
 
 ```bash
-bash ~/git/openclaw-tg-dl-using-localapi/patch/apply-patch.sh --restore
+node ~/git/openclaw-tg-dl-using-localapi/scripts/patch-openclaw.js
+openclaw gateway restart
+```
+
+The patch script is **idempotent** — safe to re-run.
+
+## How It Works
+
+### End-to-End Flow (Layer 1 — Transparent)
+
+```
+User sends 50MB video via Telegram
+       │
+       ▼
+OpenClaw receives Telegram update (message has file_id)
+       │
+       ▼
+resolveMedia() detects localBotApiUrl in config
+       │
+       ▼
+Calls Local Bot API (localhost:18995) getFile → returns local file_path
+       │
+       ▼
+Downloads file from Local Bot API /file/bot<token>/... → saves to disk
+       │
+       ▼
+File passed to AI as media attachment (same as any normal file)
+       │
+       ▼
+AI processes the file normally (ASR, forwarding, etc.)
+```
+
+### Fallback Flow (Layer 2 — AI-Triggered)
+
+```
+resolveMedia() fails (Local Bot API down, network issue, etc.)
+       │
+       ▼
+★ PATCH CODE: detects msg has file_id but media is null
+       │
+       ▼
+Injects <telegram_large_file> tag with file_id/metadata into msg.text
+       │
+       ▼
+AI sees <telegram_large_file> tag → reads SKILL.md
+       │
+       ▼
+AI calls tg-download.sh with file_id → downloads via Local Bot API
+       │
+       ▼
+AI processes the downloaded file
 ```
 
 ## What the Patch Modifies
 
-### Config Schema (6 files)
+The `scripts/patch-openclaw.js` applies three types of changes to OpenClaw's dist files:
 
-Adds `localBotApiUrl: z.string().optional()` to the Telegram channel config schema (`TelegramAccountSchemaBase`), allowing the field in `openclaw.json` without validation errors.
+### 1. Config Schema (~6 files)
 
-### resolveMedia Function (5 files)
+Adds `localBotApiUrl: z.string().optional()` to the Telegram channel Zod schema.
 
-Modifies the `resolveMedia(ctx, maxBytes, token, proxyFetch)` function:
+### 2. resolveMedia() Integration (~5 files)
 
-1. **Adds `localBotApiUrl` parameter** to the function signature
-2. **Adds `fileApiBase`** — resolves to Local Bot API URL when configured, falls back to `api.telegram.org`
-3. **Adds `getFilePath` helper** — when `localBotApiUrl` is set, calls `getFile` via HTTP directly to the Local Bot API instead of through grammY's `ctx.getFile()` (which always uses the standard API)
-4. **Updates download URL** — uses `fileApiBase` instead of hardcoded `api.telegram.org`
-5. **Updates call sites** — passes `telegramCfg.localBotApiUrl` from config
+- Adds `localBotApiUrl` parameter to `resolveMedia()`
+- Routes `getFile` and file downloads through Local Bot API when configured
+- Falls back to standard `api.telegram.org` when `localBotApiUrl` is not set
 
-### What's NOT Changed
+**Before:**
+```javascript
+async function resolveMedia(ctx, maxBytes, token, proxyFetch) {
+    // Downloads via https://api.telegram.org — limited to 20 MB
+}
+```
 
-- Bot constructor (`new Bot(token, ...)`) — all non-file-download API calls stay on standard API
-- Probe/audit functions — health checks stay on standard API
-- Message sending, reactions, etc. — all standard API
+**After:**
+```javascript
+async function resolveMedia(ctx, maxBytes, token, proxyFetch, localBotApiUrl) {
+    const fileApiBase = localBotApiUrl
+        ? localBotApiUrl.replace(/\/+$/, "")
+        : "https://api.telegram.org";
+    // Downloads via localBotApiUrl when configured — up to 2 GB
+}
+```
 
-## Standalone Download Script
+### 3. File ID Injection (~5 files)
 
-`scripts/tg-download.sh` can download files by `file_id` independently:
+When `resolveMedia()` returns null, injects `<telegram_large_file>` XML tag with JSON metadata into the message body.
+
+### Patch Markers
+
+- `/* tg-localapi-url-patch */` — Local Bot API URL integration
+- `/* tg-dl-localapi-patch */` — File ID injection
+
+Both markers ensure idempotency — the script skips already-patched files.
+
+## Usage
+
+### Automatic (with localBotApiUrl)
+
+Once patched and configured, files up to 2 GB are downloaded transparently. No special action needed.
+
+### Manual (by file_id)
 
 ```bash
-scripts/tg-download.sh <file_id> -o /output/dir
+# Basic download
+scripts/tg-download.sh "BAADBAADxwADZv..." -o /output/dir
+
+# With volume mount (fastest)
+scripts/tg-download.sh "BAADBAADxwADZv..." -o /output/dir -v /opt/docker/telegram-bot-api/data
+
+# Capture path for pipeline
+FILE_PATH=$(scripts/tg-download.sh "$FILE_ID" -o /home/kino/asr)
+echo "Downloaded to: $FILE_PATH"
 ```
 
 | Flag | Default | Description |
@@ -148,30 +181,34 @@ scripts/tg-download.sh <file_id> -o /output/dir
 | `-c` | `telegram-bot-api` | Docker container name |
 | `-v` | (none) | Host volume path for `/var/lib/telegram-bot-api` |
 
-## Architecture
+## Docker Setup for Local Bot API
 
+If you don't have the Local Bot API container yet, add to your `docker-compose.yml`:
+
+```yaml
+telegram-bot-api:
+  image: aiogram/telegram-bot-api:latest
+  restart: unless-stopped
+  environment:
+    TELEGRAM_API_ID: "<your-api-id>"       # From https://my.telegram.org
+    TELEGRAM_API_HASH: "<your-api-hash>"   # From https://my.telegram.org
+    TELEGRAM_LOCAL: "true"
+  ports:
+    - "18995:8081"
+  volumes:
+    - telegram-bot-api-data:/var/lib/telegram-bot-api
 ```
-User sends 50MB file via Telegram
-       │
-       ▼
-OpenClaw receives Telegram update (message has file_id)
-       │
-       ▼
-resolveMedia() → getFilePath() → getFile via Local Bot API (port 18995)
-       │                              │
-       │                    ┌─────────┴─────────┐
-       │                    │ telegram-bot-api   │
-       │                    │ Docker container   │
-       │                    │ (downloads from    │
-       │                    │  Telegram servers) │
-       │                    └─────────┬─────────┘
-       │                              │
-       ▼                              ▼
-Downloads file content via Local Bot API → saves to disk
-       │
-       ▼
-File attached to message → AI receives it normally
-```
+
+Get `api_id` and `api_hash` from [https://my.telegram.org](https://my.telegram.org).
+
+## Environment Variables
+
+| Variable | Equivalent Flag |
+|----------|----------------|
+| `TG_DL_TOKEN` | `-t` |
+| `TG_DL_API_URL` | `-u` |
+| `TG_DL_CONTAINER` | `-c` |
+| `TG_DL_VOLUME_MAP` | `-v` |
 
 ## License
 
