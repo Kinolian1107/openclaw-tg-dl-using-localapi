@@ -1,76 +1,88 @@
 ---
 name: tg-dl-localapi
 description: >
-  Download Telegram files by file_id using a Local Bot API Server, bypassing
-  the 20 MB standard Bot API limit (up to 2 GB). Use when you need to download
-  a Telegram file by file_id — especially large audio, video, or document files.
-  Also useful when other skills need to re-download files outside the normal
-  message pipeline, from cron jobs, or by explicit file_id.
-  Triggers on keywords: download telegram file, tg download, file_id,
-  下載 Telegram 檔案, 大檔案下載, local bot api download.
+  Download Telegram files by file_id using a Local Bot API Server (docker cp),
+  bypassing the 20 MB standard Bot API limit (up to 2 GB). Use when you have a
+  Telegram file_id and need to download the actual file — especially for large
+  audio, video, or document files. Triggers on keywords: download telegram file,
+  tg download, file_id, 下載 Telegram 檔案, 大檔案下載.
 metadata:
   openclaw:
     emoji: "📥"
     requires:
-      bins: ["curl", "python3"]
+      bins: ["curl", "python3", "docker"]
     os: ["linux"]
 ---
 
 # Telegram Local Bot API Downloader
 
-Download Telegram files by `file_id` using a Local Bot API Server, bypassing the standard 20 MB limit (up to 2 GB).
+Download Telegram files by `file_id` via a Local Bot API Server container. Bypasses the standard 20 MB limit (up to 2 GB).
 
 ## Prerequisites
 
-- A running [Telegram Bot API Server](https://github.com/tdlib/telegram-bot-api) at `http://localhost:18995` (or custom URL)
-- Bot token is auto-detected from `~/.openclaw/openclaw.json`
+- A running `telegram-bot-api` Docker container (e.g. `aiogram/telegram-bot-api`) with `TELEGRAM_LOCAL=true`
+- `docker` CLI accessible (for `docker cp`)
+- Bot token auto-detected from `~/.openclaw/openclaw.json`
+
+## How It Works
+
+The Local Bot API in `TELEGRAM_LOCAL=true` mode returns **absolute container paths** from `getFile` (e.g. `/var/lib/telegram-bot-api/.../file.mp4`). The standard HTTP download endpoint does not serve these paths.
+
+This script uses a 3-tier fallback:
+1. **Volume mount** — direct copy from host filesystem (fastest; requires `-v` flag and readable permissions)
+2. **docker cp** — copy from container (default, always works if docker is available)
+3. **HTTP download** — standard `/file/bot<token>/` endpoint (fallback for non-local mode)
 
 ## Usage
 
 Run `scripts/tg-download.sh` (resolve relative to this SKILL.md's directory):
 
 ```bash
-bash "${SKILL_DIR}/scripts/tg-download.sh" <file_id> [-o output_dir] [-t bot_token] [-u api_url]
+SKILL_DIR="$(dirname "$(readlink -f "$0")")"  # or hardcode the path
+"${SKILL_DIR}/scripts/tg-download.sh" <file_id> [options]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-o` | `.` (cwd) | Output directory |
-| `-t` | auto-detect from `openclaw.json` | Bot token |
+| `-t` | auto from `openclaw.json` | Bot token |
 | `-u` | `http://localhost:18995` | Local Bot API URL |
+| `-c` | `telegram-bot-api` | Docker container name |
+| `-v` | (none) | Host volume path mapping to `/var/lib/telegram-bot-api` |
 
-The script prints the **absolute path** of the downloaded file to stdout. All status/progress messages go to stderr.
+The script prints the **absolute path** of the downloaded file to **stdout**. Status messages go to stderr.
 
 ## Examples
 
 ```bash
-SKILL_DIR="$(dirname "$(readlink -f "$0")")"
+# Basic download
+scripts/tg-download.sh "BAADBAADxwADZv..." -o /home/kino/asr
 
-# Download a file to /home/kino/asr
-bash "${SKILL_DIR}/scripts/tg-download.sh" "BAADBAADxwADZv..." -o /home/kino/asr
+# With volume mount (fastest when permissions allow)
+scripts/tg-download.sh "BAADBAADxwADZv..." -o /home/kino/asr -v /opt/docker/telegram-bot-api/data
 
-# Custom API URL
-bash "${SKILL_DIR}/scripts/tg-download.sh" "BAADBAADxwADZv..." -u http://192.168.1.100:8081
+# Capture path in a variable for further processing
+FILE_PATH=$(scripts/tg-download.sh "$FILE_ID" -o /home/kino/asr)
+echo "Downloaded to: $FILE_PATH"
 ```
 
 ## Integration with Other Skills
 
-Other skills (e.g., ASR) can call this to download large files before processing:
+Other skills (e.g. ASR) can call this script to download large files before processing:
 
 ```bash
-TG_DL_SKILL="$HOME/.openclaw/skills/tg-dl-localapi"
-FILE_PATH=$(bash "${TG_DL_SKILL}/scripts/tg-download.sh" "$FILE_ID" -o /home/kino/asr)
-# then process $FILE_PATH with ffmpeg / whisper / etc.
+SKILL_DIR="/home/kino/git/openclaw-tg-dl-using-localapi"
+FILE_PATH=$("${SKILL_DIR}/scripts/tg-download.sh" "$FILE_ID" -o /home/kino/asr)
+ffmpeg -i "$FILE_PATH" ...
 ```
 
-## How It Works
+## Environment Variables
 
-1. Calls `getFile` on the Local Bot API to resolve `file_id` → local file path
-2. Downloads the file via the Local Bot API's `/file/` endpoint
-3. Shows download progress for large files
-4. Saves to the output directory preserving original filename
-5. Prints absolute path to stdout
+All flags can also be set via environment variables (flags take priority):
 
-## Note on OpenClaw Built-in Support
-
-OpenClaw natively supports `localBotApiUrl` in its Telegram config. If set in `openclaw.json`, incoming files are automatically downloaded via the Local Bot API. This skill is for **out-of-pipeline** use: re-downloading by `file_id`, cron jobs, or integration with other skills.
+| Variable | Equivalent Flag |
+|----------|----------------|
+| `TG_DL_TOKEN` | `-t` |
+| `TG_DL_API_URL` | `-u` |
+| `TG_DL_CONTAINER` | `-c` |
+| `TG_DL_VOLUME_MAP` | `-v` |
