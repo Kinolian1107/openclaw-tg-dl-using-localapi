@@ -11,7 +11,7 @@ metadata:
   openclaw:
     emoji: "📥"
     requires:
-      bins: ["curl", "python3", "docker"]
+      bins: ["curl", "python3"]
     os: ["linux"]
 ---
 
@@ -24,7 +24,7 @@ Download Telegram files by `file_id` via a Local Bot API Server container, bypas
 ### 1. Prerequisites
 
 - A running `telegram-bot-api` Docker container (e.g. `aiogram/telegram-bot-api`) with `TELEGRAM_LOCAL=true`
-- `docker` CLI accessible
+- `curl`, `python3` available on the host
 - Bot token auto-detected from `~/.openclaw/openclaw.json`
 
 ### 2. Apply the OpenClaw Patch
@@ -32,7 +32,7 @@ Download Telegram files by `file_id` via a Local Bot API Server container, bypas
 The patch modifies OpenClaw's dist files so that when Telegram sends a file >20 MB, the AI receives a `<telegram_large_file>` tag containing the `file_id` and file metadata — enabling automatic download.
 
 ```bash
-node /path/to/this/skill/scripts/patch-openclaw.js
+node scripts/patch-openclaw.js
 ```
 
 The patch is **idempotent** — re-running on already-patched files is safe.
@@ -48,37 +48,41 @@ openclaw gateway restart
 Each `openclaw update` replaces the dist files. Re-run the patch script afterward:
 
 ```bash
-openclaw update && node /path/to/this/skill/scripts/patch-openclaw.js && openclaw gateway restart
+node scripts/patch-openclaw.js && openclaw gateway restart
 ```
 
-## How It Works
+## Automatic Trigger (How the AI Should Handle `<telegram_large_file>`)
 
-### Automatic Flow (with patch applied)
-
-1. User sends a file >20 MB via Telegram
-2. OpenClaw's `resolveMedia` fails with "file is too big" and returns null
-3. **The patch** detects this and injects metadata into the message body:
+When a user sends a file >20 MB via Telegram, the patched OpenClaw injects a tag into the message:
 
 ```
 <telegram_large_file>{"file_id":"BAADBAADxw...","file_size":52428800,"file_name":"video.mp4","mime_type":"video/mp4"}</telegram_large_file>
 ```
 
-4. The AI sees the `<telegram_large_file>` tag and extracts `file_id`
-5. The AI calls `scripts/tg-download.sh` with the `file_id` to download via Local Bot API
-6. The file is saved locally and available for further processing (e.g. ASR transcription)
+**When you see `<telegram_large_file>` in a user message, you MUST:**
 
-### AI Instructions
-
-When you see `<telegram_large_file>` in a message, extract the `file_id` from the JSON and download the file:
+1. Parse the JSON inside the tag to extract `file_id`, `file_name`, `file_size`, `mime_type`
+2. Download the file using the script below:
 
 ```bash
 SKILL_DIR="$(dirname "$(readlink -f ~/.openclaw/skills/tg-dl-localapi/SKILL.md)")"
 FILE_PATH=$("${SKILL_DIR}/scripts/tg-download.sh" "<file_id>" -o /home/kino/asr)
 ```
 
-Then process the downloaded file as needed (e.g. pass to ASR skill for transcription).
+3. `FILE_PATH` (stdout) is the absolute path of the downloaded file
+4. Process the file as needed (e.g. pass to ASR skill for transcription, or send it back)
 
-### Manual Usage
+**Example: User sends a 50MB video with caption "轉逐字稿"**
+
+The message body will look like:
+```
+轉逐字稿
+<telegram_large_file>{"file_id":"BAADBAADxw...","file_size":52428800,"file_name":"video.mp4","mime_type":"video/mp4"}</telegram_large_file>
+```
+
+→ Extract file_id → Download via tg-download.sh → Pass to ASR skill.
+
+## Manual Usage
 
 ```bash
 scripts/tg-download.sh <file_id> [options]
@@ -99,20 +103,6 @@ The script prints the **absolute path** of the downloaded file to **stdout**. St
 1. **Volume mount** — direct copy from host filesystem (fastest; requires `-v` flag)
 2. **docker cp** — copy from container (default, always works if docker is available)
 3. **HTTP download** — standard `/file/bot<token>/` endpoint (fallback for non-local mode)
-
-## Examples
-
-```bash
-# Download with file_id
-scripts/tg-download.sh "BAADBAADxwADZv..." -o /home/kino/asr
-
-# With volume mount (fastest)
-scripts/tg-download.sh "BAADBAADxwADZv..." -o /home/kino/asr -v /opt/docker/telegram-bot-api/data
-
-# Capture path for further processing
-FILE_PATH=$(scripts/tg-download.sh "$FILE_ID" -o /home/kino/asr)
-echo "Downloaded to: $FILE_PATH"
-```
 
 ## Integration with Other Skills
 
