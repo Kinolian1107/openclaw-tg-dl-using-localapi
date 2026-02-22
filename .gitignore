@@ -1,3 +1,4 @@
 *.tmp
 *.log
 .env
+openclaw-tg-dl-using-localapi
